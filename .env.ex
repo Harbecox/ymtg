@@ -1,0 +1,3 @@
+BOT_TOKEN=
+YM_TOKEN=
+
