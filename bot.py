@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.markdown import hbold
 from dotenv import load_dotenv; load_dotenv()
 from aiogram.client.default import DefaultBotProperties
@@ -22,12 +22,10 @@ logger = logging.getLogger(__name__)
 
 # ─── Bot & Dispatcher ────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-YM_TOKEN  = os.environ.get("YM_TOKEN", "")   # Yandex Music OAuth token (optional but recommended)
+YM_TOKEN  = os.environ.get("YM_TOKEN", "")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-
-dp  = Dispatcher()
-
+bot        = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp         = Dispatcher()
 downloader = YandexMusicDownloader(ym_token=YM_TOKEN)
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -36,20 +34,37 @@ YANDEX_MUSIC_RE = re.compile(
 )
 
 def extract_track_id(url: str) -> tuple[str, str] | None:
-    """Return (album_id, track_id) or None."""
     m = YANDEX_MUSIC_RE.search(url)
     if m:
         return m.group(2), m.group(3)
     return None
+
+
+async def send_audio_file(chat_id: int, file_path: str, track_info: dict, status_msg=None):
+    artist   = track_info.get("artist",      "Unknown Artist")
+    title    = track_info.get("title",       "Unknown Title")
+    duration = track_info.get("duration_ms", 0) // 1000
+
+    audio = FSInputFile(file_path, filename=f"{artist} - {title}.mp3")
+    await bot.send_audio(
+        chat_id=chat_id,
+        audio=audio,
+        title=title,
+        performer=artist,
+        duration=duration,
+    )
+    if status_msg:
+        await status_msg.delete()
+
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
         "🎵 <b>Яндекс Музыка — загрузчик</b>\n\n"
-        "Отправь мне ссылку на трек вида:\n"
+        "Отправь ссылку на трек:\n"
         "<code>https://music.yandex.ru/album/123/track/456</code>\n\n"
-        "Я скачаю MP3 и пришлю его сюда.\n\n"
+        "или просто название трека / исполнителя — найду и покажу список.\n\n"
         "⚙️ Команды:\n"
         "/start — это сообщение\n"
         "/help  — справка"
@@ -59,55 +74,91 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     await message.answer(
         "ℹ️ <b>Как пользоваться</b>\n\n"
-        "1. Открой Яндекс Музыку в браузере.\n"
-        "2. Зайди на страницу нужного трека.\n"
-        "3. Скопируй URL из адресной строки, он выглядит так:\n"
-        "   <code>https://music.yandex.ru/album/3192570/track/354095</code>\n"
-        "4. Вставь ссылку в этот чат и отправь.\n\n"
-        "⚠️ Для скачивания в высоком качестве (320 kbps) нужен токен "
-        "Яндекс Музыки с подпиской. Без токена доступно только низкое качество."
+        "<b>По ссылке:</b>\n"
+        "Вставь URL трека из Яндекс Музыки:\n"
+        "<code>https://music.yandex.ru/album/3192570/track/354095</code>\n\n"
+        "<b>По названию:</b>\n"
+        "Напиши название трека или исполнителя, например:\n"
+        "<code>Dua Lipa Levitating</code>\n"
+        "Бот покажет 10 результатов — нажми на нужный.\n\n"
+        "⚠️ Высокое качество (320 kbps) доступно только с токеном подписки."
     )
 
-@dp.message(F.text)
-async def handle_link(message: Message):
-    url = message.text.strip()
 
-    ids = extract_track_id(url)
-    if not ids:
-        await message.answer(
-            "❌ Не распознал ссылку на трек.\n\n"
-            "Пример корректной ссылки:\n"
-            "<code>https://music.yandex.ru/album/3192570/track/354095</code>"
-        )
+@dp.message(F.text)
+async def handle_message(message: Message):
+    text = message.text.strip()
+
+    # ── Ссылка → качаем сразу ────────────────────────────────────────────────
+    ids = extract_track_id(text)
+    if ids:
+        album_id, track_id = ids
+        status = await message.answer("⏳ Загружаю трек, подожди...")
+        try:
+            file_path, track_info = await asyncio.to_thread(
+                downloader.download_track, track_id, album_id
+            )
+            await send_audio_file(message.chat.id, file_path, track_info, status)
+        except Exception as exc:
+            logger.exception("Download failed for track %s", track_id)
+            await status.edit_text(f"❌ Ошибка:\n<code>{exc}</code>")
+        finally:
+            try:
+                if "file_path" in locals():
+                    Path(file_path).unlink(missing_ok=True)
+            except Exception:
+                pass
         return
 
-    album_id, track_id = ids
-    status = await message.answer("⏳ Загружаю трек, подожди...")
+    # ── Текст → поиск, показываем 10 кнопок ──────────────────────────────────
+    status = await message.answer("🔍 Ищу треки...")
+    try:
+        results = await asyncio.to_thread(
+            lambda: downloader._client.search(text, type_="track")
+        )
+        tracks = results.tracks.results if results.tracks else []
+        tracks = tracks[:10]
+
+        if not tracks:
+            await status.edit_text("❌ Ничего не найдено по запросу: " + text)
+            return
+
+        buttons = []
+        for t in tracks:
+            artist = t.artists[0].name if t.artists else "Unknown"
+            album_id = t.albums[0].id if t.albums else 0
+            label = f"{artist} — {t.title}"
+            callback = f"dl:{t.id}:{album_id}"
+            buttons.append([InlineKeyboardButton(text=label, callback_data=callback)])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await status.edit_text(
+            f"🎵 Результаты по запросу <b>{text}</b>:",
+            reply_markup=keyboard,
+        )
+
+    except Exception as exc:
+        logger.exception("Search failed: %s", text)
+        await status.edit_text(f"❌ Ошибка поиска:\n<code>{exc}</code>")
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def handle_download(callback: CallbackQuery):
+    _, track_id, album_id = callback.data.split(":")
+    album_id = album_id if album_id != "0" else None
+
+    await callback.answer()
+    status = await callback.message.answer("⏳ Загружаю трек, подожди...")
 
     try:
         file_path, track_info = await asyncio.to_thread(
             downloader.download_track, track_id, album_id
         )
-
-        artist = track_info.get("artist", "Unknown Artist")
-        title  = track_info.get("title",  "Unknown Title")
-        duration = track_info.get("duration_ms", 0) // 1000
-
-        audio = FSInputFile(file_path, filename=f"{artist} - {title}.mp3")
-        await bot.send_audio(
-            chat_id=message.chat.id,
-            audio=audio,
-            title=title,
-            performer=artist,
-            duration=duration,
-        )
-        await status.delete()
-
+        await send_audio_file(callback.message.chat.id, file_path, track_info, status)
     except Exception as exc:
         logger.exception("Download failed for track %s", track_id)
-        await status.edit_text(f"❌ Ошибка при загрузке:\n<code>{exc}</code>")
+        await status.edit_text(f"❌ Ошибка:\n<code>{exc}</code>")
     finally:
-        # Clean up the temp file
         try:
             if "file_path" in locals():
                 Path(file_path).unlink(missing_ok=True)

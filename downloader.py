@@ -89,3 +89,36 @@ class YandexMusicDownloader:
         logger.info("Downloaded to %s", tmp.name)
 
         return tmp.name, track_info
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def search_and_download(self, query: str) -> tuple[str, dict]:
+        """
+        Ищет трек по названию и скачивает первый результат.
+
+        Parameters
+        ----------
+        query : str
+            Поисковый запрос (название трека, исполнитель и т.п.).
+
+        Returns
+        -------
+        tuple[str, dict]
+            Путь к временному MP3-файлу и словарь с метаданными трека.
+
+        Raises
+        ------
+        RuntimeError
+            Если поиск не вернул ни одного трека.
+        """
+        logger.info("Searching for: %s", query)
+        result = self._client.search(query, type_="track")
+
+        tracks = result.tracks
+        if not tracks or not tracks.results:
+            raise RuntimeError(f"Треки по запросу «{query}» не найдены.")
+
+        first = tracks.results[0]
+        album_id = first.albums[0].id if first.albums else None
+        logger.info("Found: %s — %s (id=%s)", first.artists[0].name if first.artists else "?", first.title, first.id)
+
+        return self.download_track(first.id, album_id)
