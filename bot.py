@@ -57,13 +57,20 @@ def tracks_list_keyboard(tracks) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def send_audio_file(chat_id: int, file_path: str, track_info: dict, status_msg=None):
+def similar_keyboard(track_id, album_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔁 Похожие", callback_data=f"sim:{track_id}:{album_id or 0}"),
+    ]])
+
+
+async def send_audio_file(chat_id: int, file_path: str, track_info: dict, status_msg=None, track_id=None, album_id=None):
     artist   = track_info.get("artist",      "Unknown Artist")
     title    = track_info.get("title",       "Unknown Title")
     duration = track_info.get("duration_ms", 0) // 1000
 
+    markup = similar_keyboard(track_id, album_id) if track_id else None
     audio = FSInputFile(file_path, filename=f"{artist} - {title}.mp3")
-    await bot.send_audio(chat_id=chat_id, audio=audio, title=title, performer=artist, duration=duration)
+    await bot.send_audio(chat_id=chat_id, audio=audio, title=title, performer=artist, duration=duration, reply_markup=markup)
     if status_msg:
         await status_msg.delete()
 
@@ -151,7 +158,7 @@ async def handle_download(callback: CallbackQuery):
         file_path, track_info = await asyncio.to_thread(
             downloader.download_track, track_id, album_id
         )
-        await send_audio_file(callback.message.chat.id, file_path, track_info, status)
+        await send_audio_file(callback.message.chat.id, file_path, track_info, status, track_id=track_id, album_id=album_id)
     except Exception as exc:
         logger.exception("Download failed for track %s", track_id)
         await status.edit_text(f"❌ Ошибка:\n<code>{exc}</code>")
